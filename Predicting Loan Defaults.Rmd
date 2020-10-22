@@ -1,0 +1,461 @@
+---
+title: "Predicting Loan Defaults with Logistic Regression"
+author: "Mohan Rajendran"
+date: "March 2, 2019"
+output: word_document
+---
+
+## Setup
+
+### Load Packages
+```{r message=FALSE, warning=FALSE}
+library(readr)
+library(dplyr)
+library(magrittr)
+library(Amelia)
+library(mice)
+library(ggplot2)
+library(gridExtra)
+library(car)
+library(leaps)
+library(lmtest)
+library(pscl)
+library(ResourceSelection)
+```
+
+### Load Data
+```{r message=FALSE, warning=FALSE}
+Loans_Initial_df <- read_csv(file="loans50k.csv", col_names=TRUE, na = c("", "NA", "n/a", "#VALUE!"))
+Loans_df <- Loans_Initial_df
+```
+
+*** 
+## Introduction
+The purpose of this project is to predict which applicants are likely to default on their loans using Logistic Regression. The dataset includes 30 variables for 50,000 loans. This dataset will be cleaned and any missing values will be imputed before creating the predictive model. The mdoel will help the banks to predict the outcome of the loan therby reducing the risk associated with loan defaults.
+
+*** 
+## Data Preparation
+As part of data preparation we will prepare response variable, clean the data, perform feature engineering and impute missing values.
+
+### Response Variable
+The response variable is created based out of status variable. Any loans with status as Fully Paid are considered 'Good' and the ones with status as Charged off or Default are considered 'Bad'. Any loans with status other than the three mentioned above are removed from the data.
+
+```{r}
+Loans_df <- Loans_df %>% filter(status %in% c('Charged Off', 'Fully Paid', 'Default'))
+Loans_df <- Loans_df %>% 
+  mutate(responseVar = as.factor(ifelse(status == 'Fully Paid', 'Good', 'Bad')))
+
+```
+
+### Data Cleaning
+We identified some of the variables to be either irrelevant (employment) or information that is not known prior to loan provision(totalPaid). Though loadID variable can be ignored we want to keep this for time being so as to facilitate easy row manipulation.We also identified a row with loanID 656728 which is invalid and removed it from the data.
+
+```{r include=FALSE}
+
+Loans_df <- Loans_df %>% 
+  select(-c('employment', 'totalPaid'))
+
+Loans_df <- Loans_df[!(Loans_df$loanID == 656728),]
+sapply(Loans_df, summary)
+
+```
+### Feature Engineering
+
+Now we can proceed to perform feature engineering on two of the variables 'status' and 'reason'. FOr the purpose of this project, we merged the status 'Default' with 'Charged off'. Similarly for the reason variable we merged 'car' and 'house' to form a new category 'Asset_Purchase' and 'renewable_energy' and 'wedding' to category 'other'. Though vacation and emergency can be merged with other, for time being we prefer not to since we believe them to have a influence on loan repayment capability.
+```{r}
+
+Loans_df <- Loans_df %>% 
+  mutate(status = ifelse(status == 'Default', 'Charged Off', status))
+
+Loans_df <- Loans_df %>% 
+  mutate(reason = ifelse(reason == 'car' | reason == 'house', 'Asset_Purchase', 
+                         ifelse(reason == 'renewable_energy' | reason == 'wedding', 'other', reason)))
+
+Loans_df <- Loans_df %>%
+  mutate_if(sapply(Loans_df, is.character), as.factor)
+
+```
+
+### Missing Value Imputation
+Upon analyzing the summary of the Loan_df dataframe we identified four variables length, bcRatio, bcOpen, revolRatio to have missing values/NA in them.This is confirmed by the below missmap plot. 
+
+```{r include=FALSE}
+
+NA_df <- data.frame(colSums(is.na(Loans_df)))
+colnames(NA_df) <- c( 'NA_Count')
+columnsMissingValues <- subset(NA_df, NA_Count != 0)
+columnsMissingValues
+
+```
+
+```{r warning=FALSE}
+
+missmap(Loans_df, col=c('white', 'steelblue'), legend=FALSE, y.cex = 0.8, x.cex = 0.8,margins = c(5, 5))
+
+```
+
+To impute the missing values, MICE imputation method is used. For the quantitative variables pmm(predictive mean matching) method is used while for the categorical variable 'length' polytomous regression method is used. Loan ID variable is not included in the predictor variable list. 
+
+```{r message=FALSE, warning=FALSE}
+
+init = mice(Loans_df, maxit=0) 
+meth = init$method
+predM = init$predictorMatrix
+
+
+meth[c("bcRatio")]="pmm" 
+meth[c("bcOpen")]="pmm" 
+meth[c("revolRatio")]="pmm" 
+meth[c("length")]="polyreg"
+
+predM[, c("loanID")]=0
+
+set.seed(1984)
+ImpPMMMethod <- mice(Loans_df, method = meth, predictorMatrix=predM, m=1, maxit=5)
+
+Loans_Imputed_df <- complete(ImpPMMMethod,1)
+
+```
+
+The density plot and mismap plot is plotted again to verify whether all the missing values are imputed and are inline with existing values
+
+```{r}
+missmap(Loans_Imputed_df, col=c('white', 'steelblue'), legend=FALSE, y.cex = 0.8, x.cex = 0.8,margins = c(5, 5))
+densityplot(ImpPMMMethod)
+
+```
+
+### Variable Transformations
+As a final step we will perform some transformation on the variables to eliminate the skewing in the data which is one of the prerequisite for the Logistic Regression. Since its possible for the value to be 0 in most of the variables we decided to perform cube root transformation. By exploratory data analysisfunction created for the project(below), we identified most of the income, balance and Limit variables to be skewed and hence transformation is performed on these variables. 
+
+```{r}
+
+CubeRootTransformation <- function(df, colNamesVector){
+  for (c in colNamesVector){
+   df[, c] <-  df[, c]^(1/3)
+  }
+  return(df)
+}
+
+tName <- c('payment', 'income', 'totalBal', 'totalRevLim', 'avgBal', 'bcOpen', 'totalLim', 'totalRevBal', 'totalBcLim', 'totalIlLim')
+
+Loans_Imputed_df <- CubeRootTransformation(Loans_Imputed_df, tName)
+
+```
+
+*** 
+## Exploratory Data Analysis
+The density plot and box plot are plotted for the quantitative variables and bar plots are computed for categorical variables against response variable. Upon analysing the plots its found rate has a huge impact on the outcome of the loans. Loans that are fully paid off appear to have lower rate.
+
+```{r include=FALSE}
+
+
+PlotCategory <- function(df, colName, responseVar){
+ggplot(data=Loans_Imputed_df, aes_string(x=colName, fill = responseVar)) +
+geom_bar()+
+##geom_text(stat='count', aes(label=..count..),  color="black", size=3.5)+
+scale_fill_brewer(palette="Paired")+
+  theme_minimal()
+}
+
+PlotCategory(Loans_Imputed_df, 'term', 'responseVar')
+PlotCategory(Loans_Imputed_df, 'grade', 'responseVar')
+PlotCategory(Loans_Imputed_df, 'length', 'responseVar')
+PlotCategory(Loans_Imputed_df, 'home', 'responseVar')
+PlotCategory(Loans_Imputed_df, 'verified', 'responseVar')
+PlotCategory(Loans_Imputed_df, 'status', 'responseVar')
+PlotCategory(Loans_Imputed_df, 'reason', 'responseVar')
+```
+
+
+```{r include=FALSE}
+PlotQuantitative <- function(df, colName, responseVar){
+
+      density <- ggplot(Loans_Imputed_df, aes_string(x=colName, color=responseVar)) +
+  geom_density()+
+  labs(title="Weight density curve",x=colName, y = "Density") +
+  scale_color_brewer(palette="Paired") + theme_classic()
+
+box <- ggplot(Loans_Imputed_df, aes_string(x=responseVar, y=colName)) + geom_boxplot() +
+  labs(title="Box Plot") +
+  scale_color_brewer(palette="Paired") + theme_classic()
+grid.arrange(density, box, ncol=2)
+  }
+
+
+
+PlotQuantitative(Loans_Imputed_df, 'amount', 'responseVar')
+PlotQuantitative(Loans_Imputed_df, 'rate', 'responseVar')
+PlotQuantitative(Loans_Imputed_df, 'payment', 'responseVar')##
+PlotQuantitative(Loans_Imputed_df, 'income', 'responseVar')##
+PlotQuantitative(Loans_Imputed_df, 'debtIncRat', 'responseVar')
+PlotQuantitative(Loans_Imputed_df, 'delinq2yr', 'responseVar')
+PlotQuantitative(Loans_Imputed_df, 'inq6mth', 'responseVar')
+PlotQuantitative(Loans_Imputed_df, 'openAcc', 'responseVar')
+PlotQuantitative(Loans_Imputed_df, 'pubRec', 'responseVar')
+PlotQuantitative(Loans_Imputed_df, 'revolRatio', 'responseVar')
+PlotQuantitative(Loans_Imputed_df, 'totalAcc', 'responseVar')
+PlotQuantitative(Loans_Imputed_df, 'totalBal', 'responseVar')##
+PlotQuantitative(Loans_Imputed_df, 'totalRevLim', 'responseVar')##
+PlotQuantitative(Loans_Imputed_df, 'accOpen24', 'responseVar')
+PlotQuantitative(Loans_Imputed_df, 'avgBal', 'responseVar')##
+PlotQuantitative(Loans_Imputed_df, 'bcOpen', 'responseVar')##
+PlotQuantitative(Loans_Imputed_df, 'bcRatio', 'responseVar')
+PlotQuantitative(Loans_Imputed_df, 'totalLim', 'responseVar')##
+PlotQuantitative(Loans_Imputed_df, 'totalRevBal', 'responseVar')##
+PlotQuantitative(Loans_Imputed_df, 'totalBcLim', 'responseVar')##
+PlotQuantitative(Loans_Imputed_df, 'totalIlLim', 'responseVar')##
+
+```
+```{r}
+
+PlotQuantitative(Loans_Imputed_df, 'rate', 'responseVar')
+
+```
+
+## Logistic Model
+
+We begin our Logistic Regression by splitting our data into Train and Test data in the 80:20 ratio. We also removed loanID, status from the train dataset and also the state variable so as not to introduce any location based bias.
+
+
+We then simulated the three following models Full Model with all the predicted variables, Backward Step wise Elmination approach and Forward Stepwise ELimination approach. Analysing the AIC we found there is no significant difference between the three and the same is confirmedd in the later part of analysis where the accuracy for various cut off values lined up exactly same for all three model. So from this point we will focus our analysis only on Full Model. 
+
+NOTE: WE DIDNT REMOVED ANY VARIABLES OTHER THAN THE ONES REMOVED PREVIOUSLY FROM THE PREDICTOR VARIABLE LIST. THOUGH WE CAN REMOVE CERTAIN VARIABLES BASED ON THE VIF VALUES THIS STEP IS OMITTED IN FULL MODEL SINCCE IN THE INSTRUCTIONS IT IS MENTIONED TO FIT MODEL WITH ALL PREDICTOR VARIABLES. DEPENDING ON THE COMMENTS WE CAN CORRECT THIS IF NEEDED IN FINAL SUBMISSION
+
+```{r include=FALSE}
+##Loans_Imputed_df
+
+sample_size <- floor(0.80 * nrow(Loans_Imputed_df))
+
+## seed to make partition reproducible
+set.seed(555)
+TrainRows <- sample(seq_len(nrow(Loans_Imputed_df)), size = sample_size)
+
+Loans_Train_df <- Loans_Imputed_df[TrainRows, ]
+Loans_Train_df <- Loans_Train_df %>% 
+  select(-c('loanID', 'status', 'state'))
+Loans_Test_df <- Loans_Imputed_df[-TrainRows, ]
+
+Loans_Test_df <- Loans_Test_df %>% inner_join(select(Loans_Initial_df, totalPaid, loanID),Loans_Initial_df, by = "loanID")
+
+```
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+
+Full_Model <- glm(responseVar ~ ., data = Loans_Train_df, family = "binomial")
+summary(Full_Model)
+vif(Full_Model)
+
+```
+
+```{r include=FALSE}
+
+step(Full_Model, direction="backward")
+
+Backward_Step_Model <- glm(formula = responseVar ~ amount + term + payment + grade + 
+    home + verified + reason + debtIncRat + delinq2yr + inq6mth + 
+    openAcc + revolRatio + totalAcc + totalRevLim + accOpen24 + 
+    bcOpen + bcRatio + totalLim + totalRevBal + totalIlLim, family = "binomial", 
+    data = Loans_Train_df)
+
+summary(Backward_Step_Model)
+vif(Backward_Step_Model)
+
+Backward_Step_NoCor_Model <- glm(formula = responseVar ~ term + payment + grade + 
+    home + verified + reason + debtIncRat + delinq2yr + inq6mth + 
+    openAcc + revolRatio + totalAcc + totalRevLim + accOpen24 + 
+    bcRatio + totalLim + totalIlLim, family = "binomial", 
+    data = Loans_Train_df)
+
+summary(Backward_Step_NoCor_Model)
+vif(Backward_Step_NoCor_Model)
+
+```
+
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+
+Null_Model <- glm(responseVar ~ 1, data = Loans_Train_df, family = "binomial")
+summary(Null_Model)
+
+step(Null_Model, list(upper = ~ amount	+term	+rate	+payment	+grade	+length	+home	+income	+verified		+reason	+debtIncRat	+delinq2yr	+inq6mth	+openAcc	+pubRec	+revolRatio	+totalAcc	+	totalBal	+totalRevLim	+accOpen24	+avgBal	+bcOpen	+bcRatio	+totalLim	+totalRevBal+	totalBcLim	+totalIlLim), direction="forward")
+
+
+Forward_Step_Model <- glm(formula = responseVar ~ grade + term + avgBal + debtIncRat + 
+    accOpen24 + totalLim + payment + totalRevLim + totalAcc + 
+    openAcc + delinq2yr + inq6mth + home + totalIlLim + reason + 
+    revolRatio + amount + verified + totalBcLim + totalRevBal, 
+    family = "binomial", data = Loans_Train_df)
+
+```
+
+```{r include=FALSE}
+
+summary(Forward_Step_Model)
+car::vif(Forward_Step_Model)
+
+Forward_Step_NoCor_Model <- glm(formula = responseVar ~ grade + term + avgBal + debtIncRat + 
+    accOpen24 +  payment +  totalAcc + 
+    openAcc + delinq2yr + inq6mth + home + totalIlLim + reason + 
+    revolRatio + verified + totalBcLim , 
+    family = "binomial", data = Loans_Train_df)
+
+summary(Forward_Step_NoCor_Model)
+car::vif(Forward_Step_NoCor_Model)
+
+## step(Forward_Step_NoCor_Model, scope = .~.^2, direction = 'forward')
+
+```
+
+## Threshold for Accuracy and Profit
+
+```{r include=FALSE}
+
+Loans_Test_Full_Merged_df <- Loans_Test_df
+
+Loans_Test_Full_Merged_df %>%
+  filter(responseVar == 'Good') %>%
+  summarize(Value = sum(totalPaid - amount))
+
+predictedval <- predict(Full_Model,newdata=Loans_Test_df,type='response')
+
+##predicted <- Full_Model$fitted.values 
+cutOff <- 0.25
+predicted <- ifelse(predictedval > cutOff, 'Good', 'Bad')
+Loans_Test_Full_Merged_df <- cbind(Loans_Test_Full_Merged_df, Predicted_0.25 = predicted)
+cMatrix <- caret::confusionMatrix(factor(Loans_Test_df$responseVar),factor( predicted))
+Accuracy<-round(cMatrix$overall[1],2)
+Value <- Loans_Test_Full_Merged_df %>%
+  filter(Predicted_0.25 == 'Good') %>%
+  summarize(Value = sum(totalPaid - amount))
+
+Accuracy_df <- data.frame(cutOff, Accuracy, Value$Value, row.names = NULL)
+
+cutOff <- 0.3
+predicted <- ifelse(predictedval > cutOff, 'Good', 'Bad')
+Loans_Test_Full_Merged_df <- cbind(Loans_Test_Full_Merged_df, Predicted_0.30 = predicted)
+cMatrix <- caret::confusionMatrix(factor(Loans_Test_df$responseVar),factor( predicted))
+Accuracy<-round(cMatrix$overall[1],2)
+Value <- Loans_Test_Full_Merged_df %>%
+  filter(Predicted_0.30 == 'Good') %>%
+  summarize(Value = sum(totalPaid - amount))
+Accuracy_df <- rbind(Accuracy_df, list(cutOff, Accuracy, Value$Value))
+
+cutOff <- 0.35
+predicted <- ifelse(predictedval > cutOff, 'Good', 'Bad')
+Loans_Test_Full_Merged_df <- cbind(Loans_Test_Full_Merged_df, Predicted_0.35 = predicted)
+cMatrix <- caret::confusionMatrix(factor(Loans_Test_df$responseVar),factor( predicted))
+Accuracy<-round(cMatrix$overall[1],2)
+Value <- Loans_Test_Full_Merged_df %>%
+  filter(Predicted_0.35 == 'Good') %>%
+  summarize(Value = sum(totalPaid - amount))
+Accuracy_df <- rbind(Accuracy_df, list(cutOff, Accuracy, Value$Value))
+
+cutOff <- 0.4
+predicted <- ifelse(predictedval > cutOff, 'Good', 'Bad')
+Loans_Test_Full_Merged_df <- cbind(Loans_Test_Full_Merged_df, Predicted_0.4 = predicted)
+cMatrix <- caret::confusionMatrix(factor(Loans_Test_df$responseVar),factor( predicted))
+Accuracy<-round(cMatrix$overall[1],2)
+Value <- Loans_Test_Full_Merged_df %>%
+  filter(Predicted_0.4 == 'Good') %>%
+  summarize(Value = sum(totalPaid - amount))
+Accuracy_df <- rbind(Accuracy_df, list(cutOff, Accuracy, Value$Value))
+
+cutOff <- 0.45
+predicted <- ifelse(predictedval > cutOff, 'Good', 'Bad')
+Loans_Test_Full_Merged_df <- cbind(Loans_Test_Full_Merged_df, Predicted_0.45 = predicted)
+cMatrix <- caret::confusionMatrix(factor(Loans_Test_df$responseVar),factor( predicted))
+Accuracy<-round(cMatrix$overall[1],2)
+Value <- Loans_Test_Full_Merged_df %>%
+  filter(Predicted_0.45 == 'Good') %>%
+  summarize(Value = sum(totalPaid - amount))
+Accuracy_df <- rbind(Accuracy_df, list(cutOff, Accuracy, Value$Value))
+
+cutOff <- 0.5
+predicted <- ifelse(predictedval > cutOff, 'Good', 'Bad')
+Loans_Test_Full_Merged_df <- cbind(Loans_Test_Full_Merged_df, Predicted_0.5 = predicted)
+cMatrix <- caret::confusionMatrix(factor(Loans_Test_df$responseVar),factor( predicted))
+Accuracy<-round(cMatrix$overall[1],2)
+Value <- Loans_Test_Full_Merged_df %>%
+  filter(Predicted_0.5 == 'Good') %>%
+  summarize(Value = sum(totalPaid - amount))
+Accuracy_df <- rbind(Accuracy_df, list(cutOff, Accuracy, Value$Value))
+
+cutOff <- 0.55
+predicted <- ifelse(predictedval > cutOff, 'Good', 'Bad')
+Loans_Test_Full_Merged_df <- cbind(Loans_Test_Full_Merged_df, Predicted_0.55 = predicted)
+cMatrix <- caret::confusionMatrix(factor(Loans_Test_df$responseVar),factor( predicted))
+Accuracy<-round(cMatrix$overall[1],2)
+Value <- Loans_Test_Full_Merged_df %>%
+  filter(Predicted_0.55 == 'Good') %>%
+  summarize(Value = sum(totalPaid - amount))
+Accuracy_df <- rbind(Accuracy_df, list(cutOff, Accuracy, Value$Value))
+
+cutOff <- 0.6
+predicted <- ifelse(predictedval > cutOff, 'Good', 'Bad')
+Loans_Test_Full_Merged_df <- cbind(Loans_Test_Full_Merged_df, Predicted_0.6 = predicted)
+cMatrix <- caret::confusionMatrix(factor(Loans_Test_df$responseVar),factor( predicted))
+Accuracy<-round(cMatrix$overall[1],2)
+Value <- Loans_Test_Full_Merged_df %>%
+  filter(Predicted_0.6 == 'Good') %>%
+  summarize(Value = sum(totalPaid - amount))
+Accuracy_df <- rbind(Accuracy_df, list(cutOff, Accuracy, Value$Value))
+
+cutOff <- 0.65
+predicted <- ifelse(predictedval > cutOff, 'Good', 'Bad')
+Loans_Test_Full_Merged_df <- cbind(Loans_Test_Full_Merged_df, Predicted_0.65 = predicted)
+cMatrix <- caret::confusionMatrix(factor(Loans_Test_df$responseVar),factor( predicted))
+Accuracy<-round(cMatrix$overall[1],2)
+Value <- Loans_Test_Full_Merged_df %>%
+  filter(Predicted_0.65 == 'Good') %>%
+  summarize(Value = sum(totalPaid - amount))
+Accuracy_df <- rbind(Accuracy_df, list(cutOff, Accuracy, Value$Value))
+
+cutOff <- 0.7
+predicted <- ifelse(predictedval > cutOff, 'Good', 'Bad')
+Loans_Test_Full_Merged_df <- cbind(Loans_Test_Full_Merged_df, Predicted_0.7 = predicted)
+cMatrix <- caret::confusionMatrix(factor(Loans_Test_df$responseVar),factor( predicted))
+Accuracy<-round(cMatrix$overall[1],2)
+Value <- Loans_Test_Full_Merged_df %>%
+  filter(Predicted_0.7 == 'Good') %>%
+  summarize(Value = sum(totalPaid - amount))
+Accuracy_df <- rbind(Accuracy_df, list(cutOff, Accuracy, Value$Value))
+
+cutOff <- 0.75
+predicted <- ifelse(predictedval > cutOff, 'Good', 'Bad')
+Loans_Test_Full_Merged_df <- cbind(Loans_Test_Full_Merged_df, Predicted_0.75 = predicted)
+cMatrix <- caret::confusionMatrix(factor(Loans_Test_df$responseVar),factor( predicted))
+Accuracy<-round(cMatrix$overall[1],2)
+Value <- Loans_Test_Full_Merged_df %>%
+  filter(Predicted_0.75 == 'Good') %>%
+  summarize(Value = sum(totalPaid - amount))
+Accuracy_df <- rbind(Accuracy_df, list(cutOff, Accuracy, Value$Value))
+
+Accuracy_Full_Model_df <- Accuracy_df
+Accuracy_Full_Model_df
+plotfull <- ggplot(data=Accuracy_Full_Model_df, aes(x=cutOff, y=Accuracy, group=1)) +
+  labs(title="Full Model") +
+  geom_line()+
+  geom_point()
+
+```
+
+The accuracy threshold plot is same for all the three models and we retained only the Full Model for analysis. The accuracy is highest at cutoff = 0.55.
+
+```{r}
+plotfull
+Accuracy_Full_Model_df
+
+```
+
+## Profit Threshold
+
+```{r}
+plot(Accuracy_Full_Model_df$cutOff, Accuracy_Full_Model_df$Value.Value)
+```
+
+The maximum profit is derived when the cut off threshold equals 0.65. The profit for the perfect model or the test data as it is stands at 12596572 while the model at threshold of .65 gives a profit of 3657314. Thats a increase of 30% in profit.For the profit threshold of 0.65 the overall accuracy is 0.77
+
+## Results
+The model predicts the Loans repayment outcome with a accuracy of 0.77 for maximum profit retention to the bank. The model though may not the perfect fit it does enhance the existing loan process.
